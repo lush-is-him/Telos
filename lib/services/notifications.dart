@@ -30,7 +30,7 @@ class Notifications {
 
     await _plugin.initialize(
       settings: const InitializationSettings(
-        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        android: AndroidInitializationSettings('ic_stat_telos'),
         iOS: DarwinInitializationSettings(),
       ),
       onDidReceiveNotificationResponse: (r) {
