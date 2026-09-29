@@ -1,0 +1,6 @@
+* text=auto
+*.sh text eol=lf
+deploy/systemd/* text eol=lf
+deploy/Dockerfile text eol=lf
+deploy/.env.example text eol=lf
+*.png binary
