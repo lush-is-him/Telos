@@ -4,16 +4,18 @@ import 'package:intl/intl.dart';
 import '../data/models.dart';
 import '../data/repository.dart';
 import '../services/notifications.dart';
-import 'home.dart';
+import '../services/sync.dart';
+import 'settings_screen.dart';
 import 'today_screen.dart';
 
 const _weeksShown = 26;
 
 class ProgressScreen extends StatefulWidget {
-  const ProgressScreen({super.key, required this.repo, required this.notifications});
+  const ProgressScreen({super.key, required this.repo, required this.notifications, required this.sync});
 
   final Repository repo;
   final Notifications notifications;
+  final SyncService sync;
 
   @override
   State<ProgressScreen> createState() => _ProgressScreenState();
@@ -22,7 +24,9 @@ class ProgressScreen extends StatefulWidget {
 class _ProgressScreenState extends State<ProgressScreen> {
   Map<String, DayLevel> _levels = {};
   int _streak = 0;
-  TimeOfDay _reminder = defaultReminder;
+  Map<int, ({int planned, int done})> _weekday = {};
+  List<String> _neglected = [];
+  List<Deadline> _deadlines = [];
 
   Repository get repo => widget.repo;
 
@@ -49,25 +53,72 @@ class _ProgressScreenState extends State<ProgressScreen> {
   Future<void> _load() async {
     final levels = await repo.heatmap(_start, repo.today);
     final streak = await repo.mitStreak();
-    final reminder = await loadReminderTime(repo);
+    final weekday = await repo.mitByWeekday();
+    final neglected = await repo.neglectedSubjects();
+    final deadlines = await repo.upcomingDeadlines();
     if (!mounted) return;
     setState(() {
       _levels = levels;
       _streak = streak;
-      _reminder = reminder;
+      _weekday = weekday;
+      _neglected = neglected;
+      _deadlines = deadlines;
     });
   }
 
-  Future<void> _pickReminder() async {
-    final picked = await showTimePicker(
+  Future<void> _addDeadline() async {
+    final title = TextEditingController();
+    final subject = TextEditingController();
+    var due = DateTime.now().add(const Duration(days: 7));
+    final ok = await showDialog<bool>(
       context: context,
-      initialTime: _reminder,
-      helpText: 'Nightly planning reminder',
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialog) => AlertDialog(
+          title: const Text('Add deadline'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: title,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'What'),
+              ),
+              TextField(
+                controller: subject,
+                decoration: const InputDecoration(labelText: 'Subject (optional)'),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event),
+                label: Text(DateFormat('EEE d MMM').format(due)),
+                onPressed: () async {
+                  final picked = await showDatePicker(
+                    context: context,
+                    initialDate: due,
+                    firstDate: DateTime.now(),
+                    lastDate: DateTime.now().add(const Duration(days: 730)),
+                  );
+                  if (picked != null) setDialog(() => due = picked);
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Add')),
+          ],
+        ),
+      ),
     );
-    if (picked == null) return;
-    await saveReminderTime(repo, picked);
-    await widget.notifications.schedulePlanReminder(picked);
-    setState(() => _reminder = picked);
+    if (ok == true && title.text.trim().isNotEmpty) {
+      await repo.addDeadline(title: title.text, dueDate: dateKey(due), subject: subject.text);
+    }
+  }
+
+  String _dueLabel(String due) {
+    final days = parseDateKey(due).difference(parseDateKey(repo.today)).inDays;
+    final when = DateFormat('EEE d MMM').format(parseDateKey(due));
+    return days == 0 ? '$when · today' : '$when · in $days day${days == 1 ? '' : 's'}';
   }
 
   void _openDay(String date) {
@@ -98,10 +149,14 @@ class _ProgressScreenState extends State<ProgressScreen> {
       appBar: AppBar(
         title: const Text('Progress'),
         actions: [
-          TextButton.icon(
-            onPressed: _pickReminder,
-            icon: const Icon(Icons.notifications_outlined),
-            label: Text(_reminder.format(context)),
+          IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => SettingsScreen(repo: repo, notifications: widget.notifications, sync: widget.sync),
+              ),
+            ),
           ),
         ],
       ),
@@ -191,6 +246,47 @@ class _ProgressScreenState extends State<ProgressScreen> {
                 ),
             ],
           ),
+          if (_neglected.isNotEmpty) ...[
+            const SizedBox(height: 24),
+            Card(
+              elevation: 0,
+              color: colors.errorContainer,
+              child: ListTile(
+                leading: Icon(Icons.warning_amber_rounded, color: colors.onErrorContainer),
+                title: Text('Planned often, never finished', style: TextStyle(color: colors.onErrorContainer)),
+                subtitle: Text(
+                  '${_neglected.join(', ')} — 3+ times in two weeks, nothing marked done. Smaller chunks?',
+                  style: TextStyle(color: colors.onErrorContainer),
+                ),
+              ),
+            ),
+          ],
+          const SizedBox(height: 28),
+          Text('MIT done by weekday · last 12 weeks', style: theme.textTheme.titleSmall),
+          const SizedBox(height: 12),
+          _WeekdayBars(stats: _weekday),
+          const SizedBox(height: 28),
+          Row(
+            children: [
+              Expanded(child: Text('Deadlines', style: theme.textTheme.titleSmall)),
+              TextButton.icon(onPressed: _addDeadline, icon: const Icon(Icons.add), label: const Text('Add')),
+            ],
+          ),
+          if (_deadlines.isEmpty)
+            Text('None. Deadlines help the forecast.', style: theme.textTheme.bodySmall)
+          else
+            for (final d in _deadlines)
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: Text(d.subject == null ? d.title : '${d.title} · ${d.subject}'),
+                subtitle: Text(_dueLabel(d.dueDate)),
+                trailing: IconButton(
+                  tooltip: 'Remove',
+                  icon: const Icon(Icons.close),
+                  onPressed: () => repo.deleteDeadline(d.id),
+                ),
+              ),
         ],
       ),
     );
@@ -219,6 +315,60 @@ class _Stat extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// Descriptive only: share of planned MITs done, per weekday. Bars carry the
+/// count so a 100% from one day isn't mistaken for a pattern.
+class _WeekdayBars extends StatelessWidget {
+  const _WeekdayBars({required this.stats});
+  final Map<int, ({int planned, int done})> stats;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    const labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    return SizedBox(
+      height: 132,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          for (var d = 1; d <= 7; d++)
+            Expanded(
+              child: Builder(
+                builder: (context) {
+                  final s = stats[d] ?? (planned: 0, done: 0);
+                  final rate = s.planned == 0 ? 0.0 : s.done / s.planned;
+                  return Tooltip(
+                    message: '${labels[d - 1]}: ${s.done} of ${s.planned} MITs done',
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        Text(s.planned == 0 ? '–' : '${(rate * 100).round()}%', style: theme.textTheme.labelSmall),
+                        const SizedBox(height: 4),
+                        Container(
+                          height: 4 + 80 * rate,
+                          margin: const EdgeInsets.symmetric(horizontal: 6),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.primary,
+                            borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(labels[d - 1], style: theme.textTheme.labelSmall),
+                        Text(
+                          'n=${s.planned}',
+                          style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.outline),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+        ],
       ),
     );
   }

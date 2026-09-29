@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly Telos backup (runs at next boot if the PC was off)
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00
+# Persistent: if the PC was off on Sunday 03:00, run as soon as it boots.
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

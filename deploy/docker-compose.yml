@@ -1,0 +1,38 @@
+# Telos home server: Postgres + API. `restart: unless-stopped` brings both back
+# up whenever the PC boots (with the docker service enabled).
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: telos
+      POSTGRES_USER: telos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telos -d telos"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://telos:${POSTGRES_PASSWORD}@db:5432/telos
+      TELOS_TOKEN: ${TELOS_TOKEN:?set in .env}
+      TELOS_TZ: ${TELOS_TZ:-UTC}
+    volumes:
+      - ./data:/data
+    # Bound to localhost + the Tailscale interface only; never the open LAN/internet.
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "${TAILSCALE_IP:?set in .env}:8000:8000"
+
+volumes:
+  pgdata:

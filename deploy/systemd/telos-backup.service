@@ -1,0 +1,10 @@
+[Unit]
+Description=Telos weekly Postgres backup
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Give the containers a moment after boot when this runs as a catch-up.
+ExecStartPre=/bin/sleep 60
+ExecStart=/opt/telos/deploy/backup.sh

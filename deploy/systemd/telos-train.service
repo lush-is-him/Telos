@@ -1,0 +1,9 @@
+[Unit]
+Description=Telos weekly model retrain + report
+After=docker.service telos-backup.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 120
+ExecStart=/opt/telos/deploy/retrain.sh

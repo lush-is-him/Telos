@@ -8,6 +8,7 @@ import 'package:timezone/timezone.dart' as tz;
 const planPayload = 'plan';
 
 const _planReminderId = 1;
+const _morningNudgeId = 2;
 
 /// Nightly "plan tomorrow" reminder. Uses inexact scheduling on Android: a
 /// planning nudge doesn't need to-the-minute precision, and this avoids the
@@ -66,6 +67,31 @@ class Notifications {
           'Planning reminder',
           channelDescription: 'Nightly reminder to plan tomorrow',
           importance: Importance.high,
+        ),
+        iOS: DarwinNotificationDetails(),
+      ),
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      matchDateTimeComponents: DateTimeComponents.time,
+    );
+  }
+
+  /// Optional morning "open today's MIT" nudge; null turns it off.
+  Future<void> scheduleMorningNudge(TimeOfDay? time) async {
+    await _plugin.cancel(id: _morningNudgeId);
+    if (time == null) return;
+    final now = tz.TZDateTime.now(tz.local);
+    var at = tz.TZDateTime(tz.local, now.year, now.month, now.day, time.hour, time.minute);
+    if (!at.isAfter(now)) at = at.add(const Duration(days: 1));
+    await _plugin.zonedSchedule(
+      id: _morningNudgeId,
+      scheduledDate: at,
+      title: "Today's MIT",
+      body: 'Start the timer on the one thing that matters today.',
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          'morning_nudge',
+          'Morning nudge',
+          channelDescription: "Optional reminder to open today's MIT",
         ),
         iOS: DarwinNotificationDetails(),
       ),

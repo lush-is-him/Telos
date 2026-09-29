@@ -5,14 +5,16 @@ import 'package:intl/intl.dart';
 
 import '../data/models.dart';
 import '../data/repository.dart';
+import '../services/sync.dart';
 
 String formatMinutes(int m) => m < 60 ? '${m}m' : '${m ~/ 60}h ${(m % 60).toString().padLeft(2, '0')}m';
 
 /// Today's work. With [date] set it shows that day instead (from the heatmap).
 class TodayScreen extends StatefulWidget {
-  const TodayScreen({super.key, required this.repo, this.date, this.onPlan});
+  const TodayScreen({super.key, required this.repo, this.sync, this.date, this.onPlan});
 
   final Repository repo;
+  final SyncService? sync;
   final String? date;
   final VoidCallback? onPlan;
 
@@ -24,6 +26,8 @@ class _TodayScreenState extends State<TodayScreen> with WidgetsBindingObserver {
   DayPlan? _plan;
   RunningTimer? _running;
   Timer? _ticker;
+  Prediction? _forecast;
+  int? _typical;
 
   Repository get repo => widget.repo;
   String get _date => widget.date ?? repo.today;
@@ -56,15 +60,30 @@ class _TodayScreenState extends State<TodayScreen> with WidgetsBindingObserver {
   Future<void> _load() async {
     final plan = await repo.loadDay(_date);
     final running = await repo.runningTimer();
+    final typical = await repo.typicalMinutes(plan.mit?.category);
     if (!mounted) return;
     setState(() {
       _plan = plan;
       _running = running;
+      _typical = typical;
     });
     _ticker?.cancel();
     if (running != null) {
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) => setState(() {}));
     }
+    _loadForecast(plan);
+  }
+
+  /// The server's forecast for this day's MIT, if a model has been trained.
+  /// Only shown while the MIT is still open — afterwards it's just noise.
+  Future<void> _loadForecast(DayPlan plan) async {
+    final sync = widget.sync;
+    if (sync == null || plan.mit == null || plan.mit!.done) {
+      if (_forecast != null && mounted) setState(() => _forecast = null);
+      return;
+    }
+    final p = await sync.prediction(_date);
+    if (mounted) setState(() => _forecast = p);
   }
 
   int? _liveMinutes(String itemId) {
@@ -149,7 +168,12 @@ class _TodayScreenState extends State<TodayScreen> with WidgetsBindingObserver {
         contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         leading: Checkbox(value: t.done, onChanged: (v) => repo.setTaskDone(t.id, v ?? false)),
         title: Text(t.title, style: style),
-        subtitle: _meta([t.category?.name, _timeLabel(t.timeSpentMinutes, live)]),
+        subtitle: _meta([
+          t.category?.name,
+          _timeLabel(t.timeSpentMinutes, live),
+          if (emphasised && !t.done && _typical != null) 'usually ${formatMinutes(_typical!)}',
+          if (emphasised && !t.done && _forecast != null) 'forecast ${(_forecast!.probability * 100).round()}%',
+        ]),
         trailing: t.done
             ? null
             : _TimerButton(running: live != null, onPressed: () => _toggleTimer(ItemKind.task, t.id)),

@@ -4,7 +4,7 @@
 /// - calendar dates are local `YYYY-MM-DD` TEXT
 /// - timestamps are UTC ISO-8601 TEXT
 /// - booleans are INTEGER 0/1
-const schemaVersion = 1;
+const schemaVersion = 2;
 
 const schemaV1 = <String>[
   '''
@@ -89,4 +89,32 @@ const schemaV1 = <String>[
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
   )''',
+];
+
+/// Tables mirrored to the server, in foreign-key order, with their key column.
+const syncedTables = <String, String>{
+  'day': 'date',
+  'subject': 'name',
+  'deadline': 'id',
+  'task': 'id',
+  'study_item': 'id',
+  'time_session': 'id',
+};
+
+/// v2: tombstones so deletes on the phone reach the server.
+final schemaV2 = <String>[
+  '''
+  CREATE TABLE tombstone (
+    entity      TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    deleted_at  TEXT NOT NULL,
+    PRIMARY KEY (entity, key)
+  )''',
+  for (final table in ['task', 'study_item', 'time_session', 'deadline'])
+    '''
+    CREATE TRIGGER ${table}_tombstone AFTER DELETE ON $table
+    BEGIN
+      INSERT OR REPLACE INTO tombstone (entity, key, deleted_at)
+      VALUES ('$table', OLD.id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+    END''',
 ];

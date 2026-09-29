@@ -119,3 +119,18 @@ class StudyDraft {
 
 /// Heatmap cell intensity. Derived, never stored.
 enum DayLevel { none, logged, secondaryDone, mitDone }
+
+class Deadline {
+  Deadline({required this.id, required this.title, required this.dueDate, this.subject});
+  final String id;
+  final String title;
+  final String dueDate;
+  final String? subject;
+
+  factory Deadline.fromRow(Map<String, Object?> r) => Deadline(
+    id: r['id'] as String,
+    title: r['title'] as String,
+    dueDate: r['due_date'] as String,
+    subject: r['subject'] as String?,
+  );
+}

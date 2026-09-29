@@ -5,6 +5,7 @@ import 'package:telos/data/models.dart';
 import 'package:telos/data/repository.dart';
 import 'package:telos/main.dart';
 import 'package:telos/services/notifications.dart';
+import 'package:telos/services/sync.dart';
 import 'package:telos/ui/home.dart';
 
 void main() {
@@ -29,7 +30,9 @@ void main() {
     }
 
     final shell = HomeController();
-    await tester.pumpWidget(TelosApp(repo: repo, notifications: Notifications(() {}), shell: shell));
+    await tester.pumpWidget(
+      TelosApp(repo: repo, notifications: Notifications(() {}), shell: shell, sync: SyncService(repo)),
+    );
     await settle();
     expect(find.text('Nothing planned for today.'), findsOneWidget);
 

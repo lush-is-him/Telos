@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 
@@ -7,6 +7,16 @@ import 'schema.dart';
 
 String dateKey(DateTime local) =>
     '${local.year.toString().padLeft(4, '0')}-${local.month.toString().padLeft(2, '0')}-${local.day.toString().padLeft(2, '0')}';
+
+/// Fixed-width UTC timestamp (always 6 fractional digits) so string order
+/// equals time order — the sync cursor relies on that.
+String isoUtc(DateTime t) {
+  final u = t.toUtc();
+  String two(int n) => n.toString().padLeft(2, '0');
+  final frac = (u.millisecond * 1000 + u.microsecond).toString().padLeft(6, '0');
+  return '${u.year.toString().padLeft(4, '0')}-${two(u.month)}-${two(u.day)}'
+      'T${two(u.hour)}:${two(u.minute)}:${two(u.second)}.${frac}Z';
+}
 
 DateTime parseDateKey(String key) {
   final p = key.split('-').map(int.parse).toList();
@@ -20,6 +30,17 @@ String addDays(String key, int days) {
 
 /// All reads and writes go through here. Screens listen to [revision] and
 /// reload whenever it changes.
+const syncCursorKey = 'sync_cursor';
+
+class SyncBatch {
+  SyncBatch({required this.rows, required this.deletes, required this.cursor});
+  final Map<String, List<Map<String, Object?>>> rows;
+  final List<Map<String, Object?>> deletes;
+  final String? cursor;
+
+  bool get isEmpty => rows.isEmpty && deletes.isEmpty;
+}
+
 class Repository {
   Repository(this._db, {DateTime Function()? clock}) : _clock = clock ?? DateTime.now;
 
@@ -35,8 +56,15 @@ class Repository {
         version: schemaVersion,
         onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
         onCreate: (db, _) async {
-          for (final stmt in schemaV1) {
+          for (final stmt in [...schemaV1, ...schemaV2]) {
             await db.execute(stmt);
+          }
+        },
+        onUpgrade: (db, from, _) async {
+          if (from < 2) {
+            for (final stmt in schemaV2) {
+              await db.execute(stmt);
+            }
           }
         },
       ),
@@ -47,7 +75,7 @@ class Repository {
   Future<void> close() => _db.close();
 
   DateTime get _now => _clock();
-  String get _ts => _now.toUtc().toIso8601String();
+  String get _ts => isoUtc(_now);
   String get today => dateKey(_now);
 
   void _changed() => revision.value++;
@@ -338,6 +366,145 @@ class Repository {
       cursor = addDays(cursor, -1);
     }
     return streak;
+  }
+
+  /// MIT completion rate per weekday (1 = Monday) over the last [weeks] weeks.
+  /// Descriptive only: `planned` is how many MITs existed that weekday.
+  Future<Map<int, ({int planned, int done})>> mitByWeekday({int weeks = 12}) async {
+    final rows = await _db.rawQuery("SELECT date, status FROM task WHERE type = 'mit' AND date BETWEEN ? AND ?", [
+      addDays(today, -7 * weeks),
+      today,
+    ]);
+    final out = {for (var d = 1; d <= 7; d++) d: (planned: 0, done: 0)};
+    for (final r in rows) {
+      final wd = parseDateKey(r['date'] as String).weekday;
+      final prev = out[wd]!;
+      out[wd] = (planned: prev.planned + 1, done: prev.done + (r['status'] == 'done' ? 1 : 0));
+    }
+    return out;
+  }
+
+  /// Subjects planned at least [minPlanned] times in the last [days] days
+  /// without a single item marked done.
+  Future<List<String>> neglectedSubjects({int days = 14, int minPlanned = 3}) async {
+    final rows = await _db.rawQuery(
+      """SELECT subject FROM study_item WHERE date BETWEEN ? AND ?
+         GROUP BY subject
+         HAVING COUNT(*) >= ? AND SUM(work_completed = 'done') = 0
+         ORDER BY subject""",
+      [addDays(today, -days), today, minPlanned],
+    );
+    return rows.map((r) => r['subject'] as String).toList();
+  }
+
+  /// Median minutes for completed tasks in [category] — the analysis found this
+  /// simple rule estimates duration as well as the learned models did.
+  Future<int?> typicalMinutes(Category? category) async {
+    if (category == null) return null;
+    final rows = await _db.query(
+      'task',
+      columns: ['time_spent_minutes'],
+      where: "category = ? AND status = 'done' AND time_spent_minutes > 0",
+      whereArgs: [category.name],
+      orderBy: 'time_spent_minutes',
+    );
+    if (rows.length < 3) return null;
+    return rows[rows.length ~/ 2]['time_spent_minutes'] as int;
+  }
+
+  // ---------------------------------------------------------------- deadlines
+
+  Future<List<Deadline>> upcomingDeadlines() async {
+    final rows = await _db.query('deadline', where: 'due_date >= ?', whereArgs: [today], orderBy: 'due_date');
+    return rows.map(Deadline.fromRow).toList();
+  }
+
+  Future<void> addDeadline({required String title, required String dueDate, String? subject}) async {
+    await _db.insert('deadline', {
+      'id': _uuid.v4(),
+      'title': title.trim(),
+      'subject': (subject?.trim().isEmpty ?? true) ? null : subject!.trim(),
+      'due_date': dueDate,
+      'created_at': _ts,
+      'updated_at': _ts,
+    });
+    _changed();
+  }
+
+  Future<void> deleteDeadline(String id) async {
+    await _db.delete('deadline', where: 'id = ?', whereArgs: [id]);
+    _changed();
+  }
+
+  // ---------------------------------------------------------------- sync
+
+  /// Rows changed after [cursor] (an `updated_at` value), plus pending deletes.
+  Future<SyncBatch> pendingChanges(String? cursor) async {
+    final rows = <String, List<Map<String, Object?>>>{};
+    var maxUpdated = cursor;
+    for (final table in syncedTables.keys) {
+      final r = await _db.query(
+        table,
+        where: cursor == null ? null : 'updated_at > ?',
+        whereArgs: cursor == null ? null : [cursor],
+      );
+      if (r.isEmpty) continue;
+      rows[table] = r;
+      for (final row in r) {
+        final u = row['updated_at'] as String;
+        if (maxUpdated == null || u.compareTo(maxUpdated) > 0) maxUpdated = u;
+      }
+    }
+    final deletes = await _db.query('tombstone');
+    return SyncBatch(rows: rows, deletes: deletes, cursor: maxUpdated);
+  }
+
+  /// Called after the server accepted [batch].
+  Future<void> markPushed(SyncBatch batch) async {
+    await _db.transaction((tx) async {
+      for (final d in batch.deletes) {
+        await tx.delete(
+          'tombstone',
+          where: 'entity = ? AND key = ? AND deleted_at = ?',
+          whereArgs: [d['entity'], d['key'], d['deleted_at']],
+        );
+      }
+      if (batch.cursor != null) {
+        await tx.insert('setting', {
+          'key': syncCursorKey,
+          'value': batch.cursor,
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+  }
+
+  Future<bool> hasAnyPlans() async => Sqflite.firstIntValue(await _db.rawQuery('SELECT COUNT(*) FROM task')) != 0;
+
+  /// Loads a full server snapshot into an empty database (new phone).
+  Future<int> restore(Map<String, List<Map<String, Object?>>> snapshot) async {
+    if (await hasAnyPlans()) throw StateError('Restore only works on an empty database');
+    var n = 0;
+    await _db.transaction((tx) async {
+      for (final table in syncedTables.keys) {
+        for (final row in snapshot[table] ?? const []) {
+          await tx.insert(table, row, conflictAlgorithm: ConflictAlgorithm.replace);
+          n++;
+        }
+      }
+      String? max;
+      for (final rows in snapshot.values) {
+        for (final r in rows) {
+          final u = r['updated_at'] as String?;
+          if (u != null && (max == null || u.compareTo(max) > 0)) max = u;
+        }
+      }
+      if (max != null) {
+        await tx.insert('setting', {'key': syncCursorKey, 'value': max}, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      await tx.delete('tombstone');
+    });
+    _changed();
+    return n;
   }
 
   // ---------------------------------------------------------------- settings

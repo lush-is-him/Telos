@@ -4,6 +4,7 @@ import 'package:sqflite/sqflite.dart';
 
 import 'data/repository.dart';
 import 'services/notifications.dart';
+import 'services/sync.dart';
 import 'ui/home.dart';
 
 Future<void> main() async {
@@ -16,17 +17,19 @@ Future<void> main() async {
   final notifications = Notifications(shell.openPlan);
   await notifications.init();
   await notifications.schedulePlanReminder(await loadReminderTime(repo));
+  await notifications.scheduleMorningNudge(await loadTime(repo, morningNudgeKey));
   if (await notifications.launchedFromPlanReminder()) shell.openPlan();
 
-  runApp(TelosApp(repo: repo, notifications: notifications, shell: shell));
+  runApp(TelosApp(repo: repo, notifications: notifications, shell: shell, sync: SyncService(repo)));
 }
 
 class TelosApp extends StatelessWidget {
-  const TelosApp({super.key, required this.repo, required this.notifications, required this.shell});
+  const TelosApp({super.key, required this.repo, required this.notifications, required this.shell, required this.sync});
 
   final Repository repo;
   final Notifications notifications;
   final HomeController shell;
+  final SyncService sync;
 
   @override
   Widget build(BuildContext context) {
@@ -39,7 +42,7 @@ class TelosApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: theme(Brightness.light),
       darkTheme: theme(Brightness.dark),
-      home: HomeShell(repo: repo, notifications: notifications, controller: shell),
+      home: HomeShell(repo: repo, notifications: notifications, controller: shell, sync: sync),
     );
   }
 }
