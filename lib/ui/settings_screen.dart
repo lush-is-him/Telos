@@ -69,7 +69,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _saveServer() => _run(() async {
     await repo.setSetting(serverUrlKey, _url.text.trim());
     await repo.setSetting(serverTokenKey, _token.text.trim());
-    if (!await widget.sync.ping()) return 'Saved, but the server did not answer.';
+    final problem = await widget.sync.ping();
+    if (problem != null) {
+      await repo.setSetting(lastSyncErrorKey, problem);
+      return problem;
+    }
     final err = await widget.sync.push();
     return err == null ? 'Connected and synced.' : 'Connected, but sync failed: $err';
   });
@@ -141,12 +145,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
           TextField(
             controller: _url,
             keyboardType: TextInputType.url,
+            onChanged: (_) => setState(() {}),
             decoration: const InputDecoration(
               labelText: 'Server URL',
-              hintText: 'http://ubuntu-pc.tailnet.ts.net:8000',
+              hintText: 'https://ubuntu.tail1234.ts.net',
               border: OutlineInputBorder(),
             ),
           ),
+          if (SyncService.isInsecure(_url.text))
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'This is plain http outside Tailscale: the token would travel unencrypted. '
+                'Use the PC\'s Tailscale address (100.x.y.z).',
+                style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
+              ),
+            ),
           const SizedBox(height: 12),
           TextField(
             controller: _token,

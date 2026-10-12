@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The home server is reached as http://<tailscale-ip>:8000. Android blocks plain
+  HTTP by default, so allow it. The connection itself is still encrypted by
+  Tailscale (WireGuard); the app warns if the URL is not a Tailscale address.
+  For real HTTPS instead, see deploy/README.md ("tailscale serve").
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

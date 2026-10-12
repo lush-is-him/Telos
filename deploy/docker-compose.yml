@@ -29,10 +29,11 @@ services:
       TELOS_TZ: ${TELOS_TZ:-UTC}
     volumes:
       - ./data:/data
-    # Bound to localhost + the Tailscale interface only; never the open LAN/internet.
+    # Localhost only. `tailscale serve` publishes it to your tailnet over HTTPS
+    # (see README). Binding to the Tailscale IP directly breaks at boot when
+    # Docker starts before Tailscale.
     ports:
       - "127.0.0.1:8000:8000"
-      - "${TAILSCALE_IP:?set in .env}:8000:8000"
 
 volumes:
   pgdata:

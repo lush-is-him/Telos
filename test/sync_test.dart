@@ -90,6 +90,28 @@ void main() {
     expect((await repo.pendingChanges(null)).rows['task'], hasLength(1));
   });
 
+  test('ping explains failures instead of just saying no', () async {
+    await repo.setSetting(serverUrlKey, 'http://100.101.102.103:8000');
+    await repo.setSetting(serverTokenKey, 'secret');
+    Future<String?> pingWith(http.Response Function() respond) =>
+        SyncService(repo, client: MockClient((_) async => respond())).ping();
+
+    expect(await pingWith(() => http.Response('{}', 200)), isNull);
+    expect(await pingWith(() => http.Response('bad token', 401)), contains('rejected the token'));
+    final refused = SyncService(
+      repo,
+      client: MockClient((_) async => throw const SocketException('Connection refused')),
+    );
+    expect(await refused.ping(), contains('nothing is listening'));
+  });
+
+  test('warns about plain http outside Tailscale', () {
+    expect(SyncService.isInsecure('http://100.101.102.103:8000'), isFalse);
+    expect(SyncService.isInsecure('http://ubuntu.tail1234.ts.net:8000'), isFalse);
+    expect(SyncService.isInsecure('https://anything.example.com'), isFalse);
+    expect(SyncService.isInsecure('http://192.168.1.20:8000'), isTrue);
+  });
+
   test('descriptive stats: weekday rates, neglected subjects, typical minutes', () async {
     for (var i = 0; i < 4; i++) {
       final date = addDays('2026-09-21', i); // Mon..Thu
@@ -115,7 +137,7 @@ void main() {
     await repo.setSetting(serverUrlKey, server!);
     await repo.setSetting(serverTokenKey, Platform.environment['TELOS_TOKEN']!);
     final sync = SyncService(repo);
-    expect(await sync.ping(), isTrue);
+    expect(await sync.ping(), isNull);
 
     await repo.savePlan(
       date: '2026-09-30',

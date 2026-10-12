@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
@@ -117,16 +118,47 @@ class SyncService {
     return repo.restore(rows);
   }
 
-  Future<bool> ping() async {
+  /// Null when the server answered with the right token, else a reason a
+  /// person can act on.
+  Future<String?> ping() async {
     final cfg = await _config();
-    if (cfg == null) return false;
+    if (cfg == null) return 'Enter both the server URL and the token.';
+    if (!cfg.base.hasScheme || cfg.base.host.isEmpty) {
+      return 'The URL must look like https://your-pc.tailXXXX.ts.net';
+    }
     try {
       final res = await _client
           .get(cfg.base.resolve('health'), headers: _headers(cfg.token))
-          .timeout(const Duration(seconds: 5));
-      return res.statusCode == 200;
-    } catch (_) {
-      return false;
+          .timeout(const Duration(seconds: 8));
+      return switch (res.statusCode) {
+        200 => null,
+        401 => 'The server answered but rejected the token. Copy TELOS_TOKEN from deploy/.env exactly.',
+        _ => 'The server answered with HTTP ${res.statusCode}. Is something else running on that port?',
+      };
+    } on TimeoutException {
+      return 'No answer within 8 s. Is Tailscale on (phone and PC), and is the PC awake?';
+    } catch (e) {
+      final msg = e.toString();
+      if (msg.contains('Connection refused')) {
+        return 'The PC is reachable but nothing is listening on that port. Run "docker compose ps" on the PC.';
+      }
+      if (msg.contains('Failed host lookup')) return 'Unknown host name. Check the URL, or use the Tailscale IP.';
+      if (msg.contains('Network is unreachable') || msg.contains('No route to host')) {
+        return 'Cannot reach that address. Turn Tailscale on, on the phone.';
+      }
+      return msg;
     }
+  }
+
+  /// True when [url] would travel outside Tailscale's encrypted tunnel.
+  static bool isInsecure(String url) {
+    final u = Uri.tryParse(url);
+    if (u == null || u.scheme != 'http') return false;
+    final host = u.host;
+    if (host.endsWith('.ts.net') || host == 'localhost' || host == '127.0.0.1') return false;
+    final parts = host.split('.').map(int.tryParse).toList();
+    // Tailscale addresses are 100.64.0.0/10.
+    final isTailscale = parts.length == 4 && parts[0] == 100 && parts[1] != null && parts[1]! >= 64 && parts[1]! < 128;
+    return !isTailscale;
   }
 }
