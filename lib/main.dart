@@ -14,11 +14,17 @@ Future<void> main() async {
   await repo.recordAppOpen();
 
   final shell = HomeController();
-  final notifications = Notifications(shell.openPlan);
+  final notifications = Notifications(shell.openPlan, onOpenReview: shell.openReview);
   await notifications.init();
   await notifications.schedulePlanReminder(await loadReminderTime(repo));
   await notifications.scheduleMorningNudge(await loadTime(repo, morningNudgeKey));
-  if (await notifications.launchedFromPlanReminder()) shell.openPlan();
+  await notifications.scheduleWeekReview();
+  switch (await notifications.launchPayload()) {
+    case planPayload:
+      shell.openPlan();
+    case reviewPayload:
+      shell.openReview();
+  }
 
   runApp(TelosApp(repo: repo, notifications: notifications, shell: shell, sync: SyncService(repo)));
 }

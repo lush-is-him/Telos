@@ -8,6 +8,7 @@ import '../services/sync.dart';
 import 'plan_screen.dart';
 import 'progress_screen.dart';
 import 'today_screen.dart';
+import 'week_screen.dart';
 
 const planReminderKey = 'plan_reminder_time';
 const morningNudgeKey = 'morning_nudge_time';
@@ -26,17 +27,24 @@ Future<TimeOfDay> loadReminderTime(Repository repo) async => await loadTime(repo
 Future<void> saveTime(Repository repo, String key, TimeOfDay? t) =>
     repo.setSetting(key, t == null ? '' : '${t.hour}:${t.minute}');
 
-enum HomeTab { today, plan, progress }
+enum HomeTab { today, plan, week, progress }
 
 /// Lets things outside the widget tree (notification taps) switch tabs.
 /// Bumping [planRequests] also resets the Plan screen to its default date.
 class HomeController {
   final tab = ValueNotifier<HomeTab>(HomeTab.today);
   final planRequests = ValueNotifier<int>(0);
+  final reviewRequests = ValueNotifier<int>(0);
 
   void openPlan() {
     planRequests.value++;
     tab.value = HomeTab.plan;
+  }
+
+  /// Friday evening notification: open the Week tab's review.
+  void openReview() {
+    tab.value = HomeTab.week;
+    reviewRequests.value++;
   }
 }
 
@@ -108,6 +116,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                 if (date == widget.repo.today) c.tab.value = HomeTab.today;
               },
             ),
+            WeekScreen(repo: widget.repo, reviewRequests: c.reviewRequests),
             ProgressScreen(repo: widget.repo, notifications: widget.notifications, sync: widget.sync),
           ],
         ),
@@ -121,6 +130,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
               selectedIcon: Icon(Icons.edit_note),
               label: 'Plan',
             ),
+            NavigationDestination(icon: Icon(Icons.flag_outlined), selectedIcon: Icon(Icons.flag), label: 'Week'),
             NavigationDestination(
               icon: Icon(Icons.grid_view_outlined),
               selectedIcon: Icon(Icons.grid_view),

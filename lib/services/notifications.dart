@@ -7,16 +7,24 @@ import 'package:timezone/timezone.dart' as tz;
 /// Payload that deep-links a notification tap to the Plan screen.
 const planPayload = 'plan';
 
+/// Payload that opens the Friday week review.
+const reviewPayload = 'review';
+
 const _planReminderId = 1;
 const _morningNudgeId = 2;
+const _weekReviewId = 3;
+
+/// Friday evening, when the week (Sunday to Friday) is rated.
+const weekReviewTime = TimeOfDay(hour: 18, minute: 0);
 
 /// Nightly "plan tomorrow" reminder. Uses inexact scheduling on Android: a
 /// planning nudge doesn't need to-the-minute precision, and this avoids the
 /// exact-alarm permission.
 class Notifications {
-  Notifications(this.onOpenPlan);
+  Notifications(this.onOpenPlan, {this.onOpenReview});
 
   final VoidCallback onOpenPlan;
+  final VoidCallback? onOpenReview;
   final _plugin = FlutterLocalNotificationsPlugin();
 
   Future<void> init() async {
@@ -35,6 +43,7 @@ class Notifications {
       ),
       onDidReceiveNotificationResponse: (r) {
         if (r.payload == planPayload) onOpenPlan();
+        if (r.payload == reviewPayload) onOpenReview?.call();
       },
     );
 
@@ -43,10 +52,37 @@ class Notifications {
         ?.requestNotificationsPermission();
   }
 
-  /// True when the app was cold-started by tapping the plan reminder.
-  Future<bool> launchedFromPlanReminder() async {
+  /// What a cold start from a notification tap should open, if anything.
+  Future<String?> launchPayload() async {
     final details = await _plugin.getNotificationAppLaunchDetails();
-    return details?.didNotificationLaunchApp == true && details?.notificationResponse?.payload == planPayload;
+    return details?.didNotificationLaunchApp == true ? details?.notificationResponse?.payload : null;
+  }
+
+  /// Weekly "rate your week" reminder, Fridays at [weekReviewTime].
+  Future<void> scheduleWeekReview() async {
+    await _plugin.cancel(id: _weekReviewId);
+    final now = tz.TZDateTime.now(tz.local);
+    var at = tz.TZDateTime(tz.local, now.year, now.month, now.day, weekReviewTime.hour, weekReviewTime.minute);
+    while (at.weekday != DateTime.friday || !at.isAfter(now)) {
+      at = at.add(const Duration(days: 1));
+    }
+    await _plugin.zonedSchedule(
+      id: _weekReviewId,
+      scheduledDate: at,
+      title: 'Rate your week',
+      body: 'How much of this week\'s goals did you get done? It tunes next week\'s suggestions.',
+      payload: reviewPayload,
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          'week_review',
+          'Weekly review',
+          channelDescription: 'Friday evening reminder to rate the week',
+        ),
+        iOS: DarwinNotificationDetails(),
+      ),
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      matchDateTimeComponents: DateTimeComponents.dayOfWeekAndTime,
+    );
   }
 
   Future<void> schedulePlanReminder(TimeOfDay time) async {

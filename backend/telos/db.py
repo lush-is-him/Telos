@@ -25,6 +25,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     event,
+    inspect,
     text,
 )
 
@@ -62,6 +63,50 @@ deadline = Table(
     Column("updated_at", TS, nullable=False),
 )
 
+# Weekly goals (Sunday-Friday, keyed by the Sunday). A goal is done in one go
+# or split into ordered steps; a picked task points at the goal/step.
+goal = Table(
+    "goal",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("week_start", Date, nullable=False, index=True),
+    Column("title", Text, nullable=False),
+    Column("kind", Text, nullable=False, server_default="task"),
+    Column("priority", Text, nullable=False, server_default="medium"),
+    Column("status", Text, nullable=False, server_default="open"),
+    Column("rating", Text),
+    Column("created_at", TS, nullable=False),
+    Column("updated_at", TS, nullable=False),
+    CheckConstraint("kind IN ('task', 'study', 'action')", name="goal_kind"),
+    CheckConstraint("priority IN ('high', 'medium', 'low')", name="goal_priority"),
+    CheckConstraint("status IN ('open', 'done')", name="goal_status"),
+    CheckConstraint("rating IN ('done', 'partial', 'not_done')", name="goal_rating"),
+)
+
+goal_step = Table(
+    "goal_step",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("goal_id", Text, ForeignKey("goal.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("position", Integer, nullable=False),
+    Column("title", Text, nullable=False),
+    Column("status", Text, nullable=False, server_default="open"),
+    Column("created_at", TS, nullable=False),
+    Column("updated_at", TS, nullable=False),
+    CheckConstraint("status IN ('open', 'done')", name="goal_step_status"),
+)
+
+week_review = Table(
+    "week_review",
+    metadata,
+    Column("week_start", Date, primary_key=True),
+    Column("score", Integer, nullable=False),
+    Column("reviewed_at", TS, nullable=False),
+    Column("created_at", TS, nullable=False),
+    Column("updated_at", TS, nullable=False),
+    CheckConstraint("score BETWEEN 1 AND 5", name="week_review_score"),
+)
+
 task = Table(
     "task",
     metadata,
@@ -74,6 +119,9 @@ task = Table(
     Column("completed_at", TS),
     Column("time_spent_minutes", Integer, nullable=False, server_default="0"),
     Column("planned_the_night_before", Boolean, nullable=False, server_default=text("false")),
+    # Plain columns, not foreign keys: a goal can be deleted while its tasks stay.
+    Column("goal_id", Text),
+    Column("step_id", Text),
     Column("created_at", TS, nullable=False),
     Column("updated_at", TS, nullable=False),
     CheckConstraint("type IN ('mit', 'secondary')", name="task_type"),
@@ -134,6 +182,9 @@ SYNCED: dict[str, Table] = {
     "day": day,
     "subject": subject,
     "deadline": deadline,
+    "goal": goal,
+    "goal_step": goal_step,
+    "week_review": week_review,
     "task": task,
     "study_item": study_item,
     "time_session": time_session,
@@ -156,8 +207,19 @@ def make_engine(url: str) -> Engine:
     return engine
 
 
+# Columns added after the first deploy. `create_all` only creates missing
+# tables, so existing ones get these with ALTER TABLE.
+_ADDED_COLUMNS: dict[str, list[str]] = {"task": ["goal_id", "step_id"]}
+
+
 def create_all(engine: Engine) -> None:
     metadata.create_all(engine)
+    with engine.begin() as conn:
+        for table_name, columns in _ADDED_COLUMNS.items():
+            have = {c["name"] for c in inspect(conn).get_columns(table_name)}
+            for col in columns:
+                if col not in have:
+                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col} TEXT"))
 
 
 # ----------------------------------------------------------------- wire format
