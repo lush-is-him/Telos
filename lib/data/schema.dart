@@ -4,7 +4,7 @@
 /// - calendar dates are local `YYYY-MM-DD` TEXT
 /// - timestamps are UTC ISO-8601 TEXT
 /// - booleans are INTEGER 0/1
-const schemaVersion = 2;
+const schemaVersion = 3;
 
 const schemaV1 = <String>[
   '''
@@ -96,6 +96,9 @@ const syncedTables = <String, String>{
   'day': 'date',
   'subject': 'name',
   'deadline': 'id',
+  'goal': 'id',
+  'goal_step': 'id',
+  'week_review': 'week_start',
   'task': 'id',
   'study_item': 'id',
   'time_session': 'id',
@@ -111,6 +114,54 @@ final schemaV2 = <String>[
     PRIMARY KEY (entity, key)
   )''',
   for (final table in ['task', 'study_item', 'time_session', 'deadline'])
+    '''
+    CREATE TRIGGER ${table}_tombstone AFTER DELETE ON $table
+    BEGIN
+      INSERT OR REPLACE INTO tombstone (entity, key, deleted_at)
+      VALUES ('$table', OLD.id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+    END''',
+];
+
+/// v3: weekly goals. A week runs Sunday to Friday and is keyed by its Sunday.
+/// A goal is either done in one go or split into ordered steps; whichever is
+/// the smallest unit (a step, or a goal without steps) is a "bucket item"
+/// that can be picked into a day. A picked task points back at it.
+final schemaV3 = <String>[
+  '''
+  CREATE TABLE goal (
+    id          TEXT PRIMARY KEY,
+    week_start  TEXT NOT NULL,
+    title       TEXT NOT NULL CHECK (length(trim(title)) > 0),
+    kind        TEXT NOT NULL DEFAULT 'task' CHECK (kind IN ('task', 'study', 'action')),
+    priority    TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('high', 'medium', 'low')),
+    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done')),
+    rating      TEXT CHECK (rating IN ('done', 'partial', 'not_done')),
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  )''',
+  'CREATE INDEX goal_week ON goal(week_start)',
+  '''
+  CREATE TABLE goal_step (
+    id          TEXT PRIMARY KEY,
+    goal_id     TEXT NOT NULL REFERENCES goal(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    title       TEXT NOT NULL CHECK (length(trim(title)) > 0),
+    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done')),
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  )''',
+  'CREATE INDEX goal_step_goal ON goal_step(goal_id)',
+  '''
+  CREATE TABLE week_review (
+    week_start   TEXT PRIMARY KEY,
+    score        INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+    reviewed_at  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+  )''',
+  'ALTER TABLE task ADD COLUMN goal_id TEXT',
+  'ALTER TABLE task ADD COLUMN step_id TEXT',
+  for (final table in ['goal', 'goal_step'])
     '''
     CREATE TRIGGER ${table}_tombstone AFTER DELETE ON $table
     BEGIN

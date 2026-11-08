@@ -84,7 +84,8 @@ flowchart LR
 
 | Screen | What it does |
 |---|---|
-| **Plan** | One required MIT, two optional tasks, reusable subject chips. Targets tomorrow after 15:00. Reached from the nightly notification. |
+| **Plan** | One required MIT, two optional tasks, reusable subject chips. Targets tomorrow after 15:00. Reached from the nightly notification. Above the slots, the week's task bucket: open goals and steps ranked by importance, with the top few marked *Suggested*. Tap to pick up to three; ticking a picked task off ticks its goal or step. |
+| **Week** | Weekly goals (Sunday to Friday): tasks, study topics and actions, each High / Medium / Low. Split big goals into steps. Shows how the rest would spread over the days at your pace, warns when you've set more than you usually finish, and asks for a rating on Friday evening. |
 | **Today** | Strike-through on done, one play/pause timer at a time, long-press to correct minutes. The MIT shows its typical duration and the model's forecast. |
 | **Progress** | Streak, 26-week heatmap (tap a day to see it), completion rate by weekday with *n*, a "planned often, never finished" subject warning, deadlines. |
 | **Settings** | Reminder times, optional morning nudge, server URL/token, sync status, restore-from-server. |
@@ -109,11 +110,16 @@ flutter run
 
 ## Tests
 
-- **Flutter (16):** repository, DB constraints, sync queue and tombstones, a widget-driven plan→do→progress flow, and an opt-in integration test against a live server (push, edit, delete, restore to a fresh phone).
-- **Python (10):** sync semantics (last-write-wins, delete-before-insert, auth), a hand-computed feature check, leakage, a walk-forward train/test separation check, the bootstrap, and the prediction endpoint end to end.
+- **Flutter (27):** weekly goals (week boundaries, ranking, picking and ticking through, week plan, capacity learning, review timing, carry-over, v2→v3 upgrade, a widget-driven write→split→pick→rate flow), plus repository, DB constraints, sync queue and tombstones, a widget-driven plan→do→progress flow, and an opt-in integration test against a live server (push, edit, delete, restore to a fresh phone).
+- **Python (12):** goal sync round-trip and cascade, adding the new task columns to an existing database, plus sync semantics (last-write-wins, delete-before-insert, auth), a hand-computed feature check, leakage, a walk-forward train/test separation check, the bootstrap, and the prediction endpoint end to end.
+
+### How the app learns your pace
+
+Each finished week gives one number: items achieved (steps, or goals without steps). The Friday rating counts too: a goal rated *done* counts in full, *partly* counts at least half. The estimate is a recency-weighted average of past weeks, each week back weighted 0.8, shrunk towards a starting guess of 12 a week (worth two weeks of evidence). A week where everything got done counts as one more, because it only shows capacity was *at least* that. Suggestions per day are that estimate over six days, between 1 and 3. With one data point a week, a richer model would only fit noise. This runs on the phone, so it works offline.
 
 ## Roadmap
 
 - Score live calibration from `prediction_log` once there are ~60 real forecasts.
 - Test whether the night-before effect holds on real data as a within-person comparison.
 - Title embeddings for task "specificity" once there are enough real titles.
+- Once there are ~12 reviewed weeks: add "picked from a weekly goal" and its priority as features of the MIT model, and test a learned weekly-capacity model against the shrunk average.

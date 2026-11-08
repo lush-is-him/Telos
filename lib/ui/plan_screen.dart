@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 
 import '../data/models.dart';
 import '../data/repository.dart';
+import 'week_screen.dart' show PriorityTag;
 
 /// Evening planning: one MIT, up to two secondaries, any study items.
 /// Kept to a single page so it takes ~20 seconds.
@@ -22,10 +23,24 @@ class PlanScreen extends StatefulWidget {
 }
 
 class _TaskRow {
-  _TaskRow({this.id, String title = '', this.category}) : title = TextEditingController(text: title);
+  _TaskRow({this.id, String title = '', this.category, this.goalId, this.stepId})
+    : title = TextEditingController(text: title);
   final String? id;
   final TextEditingController title;
   Category? category;
+
+  /// Set when this slot holds an item picked from the weekly bucket.
+  final String? goalId;
+  final String? stepId;
+
+  String? get itemKey => stepId ?? goalId;
+  bool get isEmpty => title.text.trim().isEmpty;
+
+  TaskDraft draft() => TaskDraft(id: id, title: title.text, category: category, goalId: goalId, stepId: stepId);
+
+  factory _TaskRow.of(Task? t) => t == null
+      ? _TaskRow()
+      : _TaskRow(id: t.id, title: t.title, category: t.category, goalId: t.goalId, stepId: t.stepId);
 }
 
 class _StudyRow {
@@ -43,6 +58,8 @@ class _PlanScreenState extends State<PlanScreen> {
   List<String> _subjects = [];
   final _newSubject = TextEditingController();
   bool _saving = false;
+  List<BucketItem> _bucket = [];
+  Set<String> _suggested = {};
 
   Repository get repo => widget.repo;
 
@@ -50,12 +67,14 @@ class _PlanScreenState extends State<PlanScreen> {
   void initState() {
     super.initState();
     widget.requests.addListener(_resetToDefault);
+    repo.revision.addListener(_refreshBucket);
     _resetToDefault();
   }
 
   @override
   void dispose() {
     widget.requests.removeListener(_resetToDefault);
+    repo.revision.removeListener(_refreshBucket);
     super.dispose();
   }
 
@@ -64,16 +83,32 @@ class _PlanScreenState extends State<PlanScreen> {
   Future<void> _loadDate(String date) async {
     final plan = await repo.loadDay(date);
     final subjects = await repo.subjects();
+    final bucket = await repo.bucket(date);
     if (!mounted) return;
     setState(() {
       _date = date;
       _subjects = subjects;
-      _mit = _TaskRow(id: plan.mit?.id, title: plan.mit?.title ?? '', category: plan.mit?.category);
+      _bucket = bucket.items;
+      _suggested = bucket.suggested;
+      _mit = _TaskRow.of(plan.mit);
       _secondaries = [
-        for (final t in plan.secondaries) _TaskRow(id: t.id, title: t.title, category: t.category),
+        for (final t in plan.secondaries) _TaskRow.of(t),
         for (var i = plan.secondaries.length; i < 2; i++) _TaskRow(),
       ];
       _study = [for (final s in plan.study) _StudyRow(id: s.id, subject: s.subject, work: s.workToDo)];
+    });
+  }
+
+  /// Goals changed elsewhere (Week tab): refresh the bucket but keep any
+  /// unsaved edits in the slots.
+  Future<void> _refreshBucket() async {
+    final date = _date;
+    if (date == null) return;
+    final bucket = await repo.bucket(date);
+    if (!mounted || date != _date) return;
+    setState(() {
+      _bucket = bucket.items;
+      _suggested = bucket.suggested;
     });
   }
 
@@ -98,10 +133,10 @@ class _PlanScreenState extends State<PlanScreen> {
     try {
       await repo.savePlan(
         date: date,
-        mit: TaskDraft(id: _mit.id, title: _mit.title.text, category: _mit.category),
+        mit: _mit.draft(),
         secondaries: [
           for (final s in _secondaries)
-            if (s.title.text.trim().isNotEmpty) TaskDraft(id: s.id, title: s.title.text, category: s.category),
+            if (!s.isEmpty) s.draft(),
         ],
         study: [
           for (final s in _study)
@@ -114,6 +149,87 @@ class _PlanScreenState extends State<PlanScreen> {
     } finally {
       if (mounted) setState(() => _saving = false);
     }
+  }
+
+  List<_TaskRow> get _slots => [_mit, ..._secondaries];
+
+  void _setSlot(int i, _TaskRow row) {
+    if (i == 0) {
+      _mit = row;
+    } else {
+      _secondaries[i - 1] = row;
+    }
+  }
+
+  /// Tapping a bucket item puts it in the first empty slot (MIT first), or
+  /// takes it back out if it's already in one.
+  void _toggle(BucketItem item) {
+    final slots = _slots;
+    final at = slots.indexWhere((r) => r.itemKey == item.key);
+    if (at >= 0) {
+      setState(() => _setSlot(at, _TaskRow()));
+      return;
+    }
+    final free = slots.indexWhere((r) => r.isEmpty);
+    if (free < 0) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('All three slots are full. Tap a picked item to free one.')));
+      return;
+    }
+    setState(
+      () => _setSlot(
+        free,
+        _TaskRow(title: item.title, category: item.goal.kind.category, goalId: item.goal.id, stepId: item.stepId),
+      ),
+    );
+  }
+
+  void _useSuggestions() {
+    for (final item in _bucket.where((i) => _suggested.contains(i.key))) {
+      if (_slots.any((r) => r.itemKey == item.key)) continue;
+      if (!_slots.any((r) => r.isEmpty)) break;
+      _toggle(item);
+    }
+  }
+
+  Widget _bucketSection() {
+    final theme = Theme.of(context);
+    final picked = {for (final r in _slots) ?r.itemKey};
+    final unpickedSuggestions = _suggested.difference(picked);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(child: Text('From your week', style: theme.textTheme.titleMedium)),
+            if (unpickedSuggestions.isNotEmpty && _slots.any((r) => r.isEmpty))
+              TextButton(onPressed: _useSuggestions, child: Text('Use ${_suggested.length} suggested')),
+          ],
+        ),
+        Text(
+          'Ranked by importance. Suggested: ${_suggested.length} for this day, from your usual pace. '
+          'Tap to pick up to three.',
+          style: theme.textTheme.bodySmall,
+        ),
+        const SizedBox(height: 6),
+        for (final item in _bucket)
+          ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            visualDensity: VisualDensity.compact,
+            leading: Icon(
+              picked.contains(item.key) ? Icons.check_circle : Icons.add_circle_outline,
+              color: picked.contains(item.key) ? theme.colorScheme.primary : null,
+            ),
+            title: Text(item.title),
+            subtitle: _suggested.contains(item.key) ? const Text('Suggested') : null,
+            trailing: PriorityTag(item.priority),
+            onTap: () => _toggle(item),
+          ),
+        const Divider(height: 24),
+      ],
+    );
   }
 
   String _label(String date) {
@@ -143,6 +259,7 @@ class _PlanScreenState extends State<PlanScreen> {
             onSelectionChanged: (s) => _loadDate(s.single),
           ),
           const SizedBox(height: 20),
+          if (_bucket.isNotEmpty) _bucketSection(),
           _taskField(_mit, label: 'Most important task'),
           const SizedBox(height: 16),
           for (final (i, row) in _secondaries.indexed) ...[
@@ -205,7 +322,13 @@ class _PlanScreenState extends State<PlanScreen> {
         TextField(
           controller: row.title,
           textCapitalization: TextCapitalization.sentences,
-          decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
+          decoration: InputDecoration(
+            labelText: label,
+            border: const OutlineInputBorder(),
+            prefixIcon: row.itemKey == null
+                ? null
+                : const Tooltip(message: 'From a weekly goal', child: Icon(Icons.flag)),
+          ),
         ),
         const SizedBox(height: 6),
         Wrap(

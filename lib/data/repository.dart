@@ -1,3 +1,5 @@
+import 'dart:math' show max, pow;
+
 import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
@@ -56,13 +58,18 @@ class Repository {
         version: schemaVersion,
         onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
         onCreate: (db, _) async {
-          for (final stmt in [...schemaV1, ...schemaV2]) {
+          for (final stmt in [...schemaV1, ...schemaV2, ...schemaV3]) {
             await db.execute(stmt);
           }
         },
         onUpgrade: (db, from, _) async {
           if (from < 2) {
             for (final stmt in schemaV2) {
+              await db.execute(stmt);
+            }
+          }
+          if (from < 3) {
+            for (final stmt in schemaV3) {
               await db.execute(stmt);
             }
           }
@@ -166,7 +173,13 @@ class Repository {
         if (d.id != null) {
           await tx.update(
             'task',
-            {'title': d.title.trim(), 'category': d.category?.name, 'updated_at': ts},
+            {
+              'title': d.title.trim(),
+              'category': d.category?.name,
+              'goal_id': d.goalId,
+              'step_id': d.stepId,
+              'updated_at': ts,
+            },
             where: 'id = ?',
             whereArgs: [d.id],
           );
@@ -177,6 +190,8 @@ class Repository {
             'type': type.name,
             'title': d.title.trim(),
             'category': d.category?.name,
+            'goal_id': d.goalId,
+            'step_id': d.stepId,
             'planned_the_night_before': nightBefore,
             'created_at': ts,
             'updated_at': ts,
@@ -238,6 +253,10 @@ class Repository {
         where: 'id = ?',
         whereArgs: [id],
       );
+      // A task picked from the weekly bucket ticks its goal or step too.
+      final link = await tx.query('task', columns: ['goal_id', 'step_id'], where: 'id = ?', whereArgs: [id]);
+      final goalId = link.firstOrNull?['goal_id'] as String?;
+      if (goalId != null) await _setItemDone(tx, goalId, link.first['step_id'] as String?, done);
     });
     _changed();
   }
@@ -434,6 +453,399 @@ class Repository {
   Future<void> deleteDeadline(String id) async {
     await _db.delete('deadline', where: 'id = ?', whereArgs: [id]);
     _changed();
+  }
+
+  // ---------------------------------------------------------------- weekly goals
+
+  /// Weeks run Sunday to Friday and are keyed by their Sunday. Saturday is the
+  /// day off between weeks, so it already belongs to the coming week: goals
+  /// set on a Saturday are for the next six days.
+  static String weekStartOf(String date) {
+    final d = parseDateKey(date);
+    if (d.weekday == DateTime.saturday) return addDays(date, 1);
+    return addDays(date, -(d.weekday % 7));
+  }
+
+  /// Sunday to Friday of the week starting [weekStart].
+  static List<String> weekDays(String weekStart) => [for (var i = 0; i < 6; i++) addDays(weekStart, i)];
+
+  String get currentWeek => weekStartOf(today);
+
+  /// Goals for a week, highest priority first, each with its steps in order.
+  Future<List<Goal>> loadWeek(String weekStart) => _goals(_db, weekStart);
+
+  Future<List<Goal>> _goals(DatabaseExecutor tx, String weekStart) async {
+    final rows = await tx.rawQuery(
+      '''SELECT * FROM goal WHERE week_start = ?
+         ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at''',
+      [weekStart],
+    );
+    if (rows.isEmpty) return [];
+    final steps = await tx.rawQuery(
+      'SELECT s.* FROM goal_step s JOIN goal g ON g.id = s.goal_id WHERE g.week_start = ? ORDER BY s.position',
+      [weekStart],
+    );
+    final byGoal = <String, List<GoalStep>>{};
+    for (final r in steps) {
+      final step = GoalStep.fromRow(r);
+      byGoal.putIfAbsent(step.goalId, () => []).add(step);
+    }
+    return [for (final r in rows) Goal.fromRow(r, byGoal[r['id']] ?? const [])];
+  }
+
+  Future<String> addGoal({
+    required String weekStart,
+    required String title,
+    GoalKind kind = GoalKind.task,
+    Priority priority = Priority.medium,
+  }) async {
+    if (title.trim().isEmpty) throw ArgumentError('A goal needs a title');
+    final id = _uuid.v4();
+    await _db.insert('goal', {
+      'id': id,
+      'week_start': weekStart,
+      'title': title.trim(),
+      'kind': kind.name,
+      'priority': priority.name,
+      'created_at': _ts,
+      'updated_at': _ts,
+    });
+    _changed();
+    return id;
+  }
+
+  Future<void> updateGoal(String id, {String? title, GoalKind? kind, Priority? priority}) async {
+    if (title != null && title.trim().isEmpty) throw ArgumentError('A goal needs a title');
+    await _db.update(
+      'goal',
+      {
+        if (title != null) 'title': title.trim(),
+        if (kind != null) 'kind': kind.name,
+        if (priority != null) 'priority': priority.name,
+        'updated_at': _ts,
+      },
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    _changed();
+  }
+
+  /// Deletes a goal and its steps. Tasks already picked from it stay, unlinked.
+  Future<void> deleteGoal(String id) async {
+    await _db.transaction((tx) async {
+      await tx.update(
+        'task',
+        {'goal_id': null, 'step_id': null, 'updated_at': _ts},
+        where: 'goal_id = ?',
+        whereArgs: [id],
+      );
+      await tx.delete('goal', where: 'id = ?', whereArgs: [id]);
+    });
+    _changed();
+  }
+
+  /// Splits a goal: adds a step at the end.
+  Future<void> addStep(String goalId, String title) async {
+    if (title.trim().isEmpty) throw ArgumentError('A step needs a title');
+    await _db.transaction((tx) async {
+      final pos =
+          Sqflite.firstIntValue(
+            await tx.rawQuery('SELECT COALESCE(MAX(position), -1) + 1 FROM goal_step WHERE goal_id = ?', [goalId]),
+          ) ??
+          0;
+      await tx.insert('goal_step', {
+        'id': _uuid.v4(),
+        'goal_id': goalId,
+        'position': pos,
+        'title': title.trim(),
+        'created_at': _ts,
+        'updated_at': _ts,
+      });
+      await _refreshGoalStatus(tx, goalId);
+    });
+    _changed();
+  }
+
+  Future<void> deleteStep(String stepId) async {
+    await _db.transaction((tx) async {
+      final rows = await tx.query('goal_step', columns: ['goal_id'], where: 'id = ?', whereArgs: [stepId]);
+      if (rows.isEmpty) return;
+      await tx.update('task', {'step_id': null, 'updated_at': _ts}, where: 'step_id = ?', whereArgs: [stepId]);
+      await tx.delete('goal_step', where: 'id = ?', whereArgs: [stepId]);
+      await _refreshGoalStatus(tx, rows.first['goal_id'] as String);
+    });
+    _changed();
+  }
+
+  /// Ticks a bucket item directly (e.g. it got done without being planned).
+  Future<void> setItemDone(String goalId, String? stepId, bool done) async {
+    await _db.transaction((tx) => _setItemDone(tx, goalId, stepId, done));
+    _changed();
+  }
+
+  Future<void> _setItemDone(DatabaseExecutor tx, String goalId, String? stepId, bool done) async {
+    final status = done ? 'done' : 'open';
+    if (stepId != null) {
+      await tx.update('goal_step', {'status': status, 'updated_at': _ts}, where: 'id = ?', whereArgs: [stepId]);
+      await _refreshGoalStatus(tx, goalId);
+    } else {
+      await tx.update(
+        'goal',
+        {'status': status, 'updated_at': _ts},
+        where: 'id = ? AND status != ?',
+        whereArgs: [goalId, status],
+      );
+    }
+  }
+
+  /// A goal with steps is done exactly when all its steps are.
+  Future<void> _refreshGoalStatus(DatabaseExecutor tx, String goalId) async {
+    final r = (await tx.rawQuery(
+      "SELECT COUNT(*) AS n, COALESCE(SUM(status = 'done'), 0) AS d FROM goal_step WHERE goal_id = ?",
+      [goalId],
+    )).first;
+    final n = r['n'] as int;
+    if (n == 0) return;
+    final status = r['d'] == n ? 'done' : 'open';
+    await tx.update(
+      'goal',
+      {'status': status, 'updated_at': _ts},
+      where: 'id = ? AND status != ?',
+      whereArgs: [goalId, status],
+    );
+  }
+
+  /// Open bucket items of [goals], in recommendation order: priority first,
+  /// then each goal's next step before anyone's second step (so one big goal
+  /// doesn't crowd out the others at the same priority), then goal age.
+  List<BucketItem> _rank(List<Goal> goals, Map<String, String> scheduled) {
+    final ranked = <(int, int, int, BucketItem)>[];
+    for (final (gi, g) in goals.indexed) {
+      if (g.steps.isEmpty) {
+        if (!g.done) ranked.add((-g.priority.weight, 0, gi, BucketItem(goal: g, scheduledFor: scheduled[g.id])));
+        continue;
+      }
+      var rank = 0;
+      for (final s in g.steps) {
+        if (s.done) continue;
+        ranked.add((-g.priority.weight, rank++, gi, BucketItem(goal: g, step: s, scheduledFor: scheduled[s.id])));
+      }
+    }
+    ranked.sort((a, b) {
+      final c = a.$1.compareTo(b.$1);
+      if (c != 0) return c;
+      final r = a.$2.compareTo(b.$2);
+      return r != 0 ? r : a.$3.compareTo(b.$3);
+    });
+    return [for (final r in ranked) r.$4];
+  }
+
+  /// Item key -> date of the open task holding it, for tasks from today on.
+  Future<Map<String, String>> _scheduledItems(String weekStart) async {
+    final rows = await _db.rawQuery(
+      '''SELECT t.date, t.goal_id, t.step_id FROM task t JOIN goal g ON g.id = t.goal_id
+         WHERE g.week_start = ? AND t.status = 'open' AND t.date >= ?''',
+      [weekStart, today],
+    );
+    return {for (final r in rows) (r['step_id'] ?? r['goal_id']) as String: r['date'] as String};
+  }
+
+  /// The bucket as seen when planning [date]: open items of that date's week
+  /// that aren't already planned for another day, best first. The first
+  /// [Capacity.perDay] are the suggestion; the person picks.
+  Future<({List<BucketItem> items, Set<String> suggested})> bucket(String date) async {
+    final week = weekStartOf(date);
+    final goals = await loadWeek(week);
+    final items = _rank(
+      goals,
+      await _scheduledItems(week),
+    ).where((i) => i.scheduledFor == null || i.scheduledFor == date).toList();
+    final perDay = (await capacity()).perDay;
+    return (items: items, suggested: items.take(perDay).map((i) => i.key).toSet());
+  }
+
+  /// The week laid out day by day: what's already planned on each day, and,
+  /// from the next day still to be planned, the remaining items spread at the
+  /// learned daily pace. Whatever doesn't fit by Friday is `overflow`;
+  /// `forecast` holds the keys of items placed by the app rather than picked.
+  Future<WeekDraft> weekDraft(String weekStart) async {
+    final goals = await loadWeek(weekStart);
+    final byKey = <String, BucketItem>{};
+    for (final g in goals) {
+      if (g.steps.isEmpty) byKey[g.id] = BucketItem(goal: g);
+      for (final s in g.steps) {
+        byKey[s.id] = BucketItem(goal: g, step: s);
+      }
+    }
+    final days = {for (final d in weekDays(weekStart)) d: <BucketItem>[]};
+    final picked = await _db.rawQuery(
+      '''SELECT t.date, t.goal_id, t.step_id FROM task t JOIN goal g ON g.id = t.goal_id
+         WHERE g.week_start = ? ORDER BY t.date, t.type, t.created_at''',
+      [weekStart],
+    );
+    for (final r in picked) {
+      final item = byKey[(r['step_id'] ?? r['goal_id']) as String];
+      if (item != null && days.containsKey(r['date'])) days[r['date']]!.add(item);
+    }
+
+    final queue = _rank(goals, await _scheduledItems(weekStart)).where((i) => i.scheduledFor == null).toList();
+    final perDay = (await capacity()).perDay;
+    final firstOpen = await defaultPlanDate();
+    final forecast = <String>{};
+    for (final d in days.keys) {
+      if (d.compareTo(firstOpen) < 0) continue;
+      while (days[d]!.length < perDay && queue.isNotEmpty) {
+        final item = queue.removeAt(0);
+        days[d]!.add(item);
+        forecast.add(item.key);
+      }
+    }
+    return WeekDraft(days: days, overflow: queue, forecast: forecast, perDay: perDay);
+  }
+
+  /// Weeks before the current one, newest first, with how many items were
+  /// planned and how many were achieved. The Friday rating counts: a goal
+  /// rated "done" counts in full even if its steps weren't ticked, "partly"
+  /// counts at least half.
+  Future<List<WeekResult>> weekHistory({int weeks = 12}) async {
+    final rows = await _db.rawQuery(
+      'SELECT DISTINCT week_start FROM goal WHERE week_start < ? ORDER BY week_start DESC LIMIT ?',
+      [currentWeek, weeks],
+    );
+    final out = <WeekResult>[];
+    for (final r in rows) {
+      final week = r['week_start'] as String;
+      var planned = 0;
+      var achieved = 0.0;
+      for (final g in await loadWeek(week)) {
+        planned += g.units;
+        achieved += switch (g.rating) {
+          GoalRating.done => g.units.toDouble(),
+          GoalRating.partial => max(g.unitsDone.toDouble(), g.units / 2),
+          _ => g.unitsDone.toDouble(),
+        };
+      }
+      out.add(WeekResult(week: week, planned: planned, achieved: achieved));
+    }
+    return out;
+  }
+
+  /// Prior belief about items per week before there is any history, and how
+  /// many weeks of evidence it is worth.
+  static const capacityPrior = 12.0;
+  static const capacityPriorWeeks = 2.0;
+
+  /// How many items a week actually get done: a recency-weighted average of
+  /// past weeks (each week back counts 0.8 as much), shrunk towards
+  /// [capacityPrior] while history is short. With one data point per week a
+  /// richer model would only fit noise; this is the honest estimate until
+  /// there are a few months of weeks.
+  ///
+  /// A week where everything planned got done only says capacity was *at
+  /// least* that much, so it counts as one item more.
+  Future<Capacity> capacity() async {
+    final history = await weekHistory();
+    var weighted = capacityPrior * capacityPriorWeeks;
+    var weights = capacityPriorWeeks;
+    var planned = 0;
+    var achieved = 0.0;
+    for (final (i, w) in history.indexed) {
+      if (w.planned == 0) continue;
+      final weight = pow(0.8, i).toDouble();
+      weighted += weight * (w.achieved >= w.planned ? w.achieved + 1 : w.achieved);
+      weights += weight;
+      planned += w.planned;
+      achieved += w.achieved;
+    }
+    return Capacity(
+      itemsPerWeek: weighted / weights,
+      weeksObserved: history.length,
+      recentRate: planned == 0 ? null : achieved / planned,
+    );
+  }
+
+  /// The week that should be rated now, if any: this week from Friday 15:00,
+  /// the week just ended on Saturday, or last week if its review was missed.
+  Future<String?> weekToReview() async {
+    final wd = _now.weekday;
+    final String week;
+    if (wd == DateTime.friday && _now.hour >= 15) {
+      week = currentWeek;
+    } else if (wd == DateTime.saturday) {
+      week = addDays(today, -6);
+    } else if (wd == DateTime.friday) {
+      return null;
+    } else {
+      week = addDays(currentWeek, -7);
+    }
+    final goals = Sqflite.firstIntValue(await _db.rawQuery('SELECT COUNT(*) FROM goal WHERE week_start = ?', [week]));
+    if (goals == 0) return null;
+    return await reviewFor(week) == null ? week : null;
+  }
+
+  Future<WeekReview?> reviewFor(String weekStart) async {
+    final rows = await _db.query('week_review', where: 'week_start = ?', whereArgs: [weekStart]);
+    if (rows.isEmpty) return null;
+    return WeekReview(weekStart: weekStart, score: rows.first['score'] as int);
+  }
+
+  /// Friday evening: an overall 1-5 score and how far each goal got.
+  Future<void> saveReview(String weekStart, {required int score, required Map<String, GoalRating> ratings}) async {
+    if (score < 1 || score > 5) throw ArgumentError('Score is 1 to 5');
+    await _db.transaction((tx) async {
+      await tx.execute(
+        '''INSERT INTO week_review (week_start, score, reviewed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(week_start) DO UPDATE SET score = excluded.score, reviewed_at = excluded.reviewed_at,
+             updated_at = excluded.updated_at''',
+        [weekStart, score, _ts, _ts, _ts],
+      );
+      for (final e in ratings.entries) {
+        await tx.update(
+          'goal',
+          {'rating': e.value.db, 'updated_at': _ts},
+          where: 'id = ? AND week_start = ?',
+          whereArgs: [e.key, weekStart],
+        );
+      }
+    });
+    _changed();
+  }
+
+  /// Copies unfinished goals (with only their open steps) from [fromWeek] into
+  /// [toWeek]. Goals whose title already exists there are skipped, so running
+  /// it twice is harmless. Returns how many goals were copied.
+  Future<int> carryOver(String fromWeek, String toWeek) async {
+    final existing = {for (final g in await loadWeek(toWeek)) g.title.toLowerCase()};
+    var n = 0;
+    await _db.transaction((tx) async {
+      for (final g in await _goals(tx, fromWeek)) {
+        if (g.done || existing.contains(g.title.toLowerCase())) continue;
+        final id = _uuid.v4();
+        await tx.insert('goal', {
+          'id': id,
+          'week_start': toWeek,
+          'title': g.title,
+          'kind': g.kind.name,
+          'priority': g.priority.name,
+          'created_at': _ts,
+          'updated_at': _ts,
+        });
+        var pos = 0;
+        for (final s in g.steps.where((s) => !s.done)) {
+          await tx.insert('goal_step', {
+            'id': _uuid.v4(),
+            'goal_id': id,
+            'position': pos++,
+            'title': s.title,
+            'created_at': _ts,
+            'updated_at': _ts,
+          });
+        }
+        n++;
+      }
+    });
+    if (n > 0) _changed();
+    return n;
   }
 
   // ---------------------------------------------------------------- sync
